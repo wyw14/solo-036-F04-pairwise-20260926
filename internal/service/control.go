@@ -200,10 +200,30 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 	if err != nil {
 		return model.OperationRecord{}, err
 	}
+	if err := r.executeLaunch(created, request); err != nil {
+		r.promoteRoute(request.RouteID)
+		if errors.Is(err, route.ErrRouteOwned) {
+			return model.OperationRecord{}, fmt.Errorf("%w; queue the application via POST /api/routes/%s/queue", err, request.RouteID)
+		}
+		return model.OperationRecord{}, err
+	}
+	select {
+	case <-ctx.Done():
+		_ = r.Cancel(created.ID)
+		return model.OperationRecord{}, ctx.Err()
+	default:
+	}
+	return r.Operation(created.ID)
+}
+
+// executeLaunch reserves the route and drives the launch sequence for a run
+// in loaded state. On failure the route reservation is rolled back; callers
+// are responsible for promoting queued applications afterwards.
+func (r *Runtime) executeLaunch(created model.Run, request LaunchRequest) error {
 	lease, routeErr := r.Routes.Reserve(request.RouteID, created.ID, created.Epoch)
 	if routeErr != nil {
 		r.recordIncident(created.ID, "warning", routeErr.Error())
-		return model.OperationRecord{}, routeErr
+		return routeErr
 	}
 	closureEpoch := created.Epoch + 1
 	r.Launcher.BeginClosure(created.ID, closureEpoch)
@@ -217,20 +237,20 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 	valveErr := r.Launcher.ConfirmClosure(closureProof)
 	if err := launcher.CombineLaunchResults(valveErr, routeErr); err != nil {
 		r.Routes.Release(request.RouteID, created.ID)
-		return model.OperationRecord{}, err
+		return err
 	}
 	if !r.Launcher.CanLaunch(closureProof) {
 		r.Routes.Release(request.RouteID, created.ID)
-		return model.OperationRecord{}, errors.New("launcher interlocks rejected current closure proof")
+		return errors.New("launcher interlocks rejected current closure proof")
 	}
 	if err := r.Pressure.Apply(created.ID, request.TargetPressure); err != nil {
 		r.Routes.Release(request.RouteID, created.ID)
-		return model.OperationRecord{}, err
+		return err
 	}
 	if err := run.Start(r.Runs, created.ID); err != nil {
 		r.Pressure.Stop()
 		r.Routes.Release(request.RouteID, created.ID)
-		return model.OperationRecord{}, err
+		return err
 	}
 	now := time.Now().UTC()
 	r.mu.Lock()
@@ -270,15 +290,9 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 		Payload: request.RouteID,
 		At:      now,
 	}); err != nil {
-		return model.OperationRecord{}, err
+		return err
 	}
-	select {
-	case <-ctx.Done():
-		_ = r.Cancel(created.ID)
-		return model.OperationRecord{}, ctx.Err()
-	default:
-	}
-	return r.Operation(created.ID)
+	return nil
 }
 
 func (r *Runtime) Track(runID string, request TrackingRequest) (model.OperationRecord, error) {
@@ -458,6 +472,7 @@ func (r *Runtime) Complete(runID, routeID string) (model.OperationRecord, error)
 	}); err != nil {
 		return model.OperationRecord{}, err
 	}
+	r.promoteRoute(routeID)
 	return r.Operation(runID)
 }
 
@@ -466,7 +481,9 @@ func (r *Runtime) Cancel(runID string) error {
 		return err
 	}
 	r.Pressure.Stop()
+	r.withdrawQueuedRun(runID)
 	r.mu.Lock()
+	released := make([]string, 0, 1)
 	for id, routeState := range r.control.Routes {
 		if routeState.RunID == runID {
 			r.Routes.Release(id, runID)
@@ -475,10 +492,14 @@ func (r *Runtime) Cancel(runID string) error {
 			routeState.LeaseEpoch = 0
 			routeState.UpdatedAt = time.Now().UTC()
 			r.control.Routes[id] = routeState
+			released = append(released, id)
 		}
 	}
 	r.control.Revision = model.NewRevision()
 	r.mu.Unlock()
+	for _, id := range released {
+		r.promoteRoute(id)
+	}
 	return r.appendEvent(model.Event{
 		RunID:   runID,
 		Kind:    "cancelled",
@@ -635,11 +656,15 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 func (r *Runtime) InterlockStatus() []model.Interlock {
 	snapshot := r.Snapshot()
 	interlocks := make([]model.Interlock, 0)
+	now := time.Now().UTC()
 	for _, routeState := range snapshot.Routes {
 		ready := !routeState.Reserved || routeState.RunID != ""
 		reason := "route is available"
 		if routeState.Reserved {
 			reason = fmt.Sprintf("fenced to %s at epoch %d", routeState.RunID, routeState.LeaseEpoch)
+		}
+		if queued := len(r.Routes.Waiting(routeState.ID, now)); queued > 0 {
+			reason = fmt.Sprintf("%s; %d application(s) queued", reason, queued)
 		}
 		interlocks = append(interlocks, model.Interlock{Name: "route/" + routeState.ID, Ready: ready, Reason: reason})
 	}
@@ -715,6 +740,7 @@ func (r *Runtime) HealthDetails() map[string]any {
 		"persistent_checksum": checksum,
 		"validation_error":    errorText(validationError),
 		"route_leases":        len(route.Snapshot(r.Routes)),
+		"queued_applications": r.Routes.WaitingCount(time.Now().UTC()),
 		"emergency_safe":      emergency.Safe(r.Pressure),
 		"pressure_samples":    len(r.Pressure.History()),
 		"recovery_steps":      recoverySteps,

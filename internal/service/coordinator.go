@@ -27,6 +27,7 @@ type Runtime struct {
 	Receiver   *receiver.Controller
 	Compressor *compressor.Worker
 	mu         sync.Mutex
+	queueMu    sync.Mutex
 	control    *ControlState
 }
 
