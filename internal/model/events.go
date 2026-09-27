@@ -34,6 +34,15 @@ type RouteLease struct {
 	Epoch      int64
 	AcquiredAt time.Time
 }
+type RouteReservation struct {
+	Route          string    `json:"route"`
+	RunID          string    `json:"run_id"`
+	Epoch          int64     `json:"epoch"`
+	StationID      string    `json:"station_id"`
+	TargetPressure float64   `json:"target_pressure"`
+	QueuedAt       time.Time `json:"queued_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
+}
 type CommandReceipt struct {
 	RunID    string
 	Command  string

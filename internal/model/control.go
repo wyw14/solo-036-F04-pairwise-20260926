@@ -70,13 +70,53 @@ type PressureState struct {
 }
 
 type RouteState struct {
-	ID          string    `json:"id"`
-	FromStation string    `json:"from_station"`
-	ToStation   string    `json:"to_station"`
-	RunID       string    `json:"run_id,omitempty"`
-	LeaseEpoch  int64     `json:"lease_epoch"`
-	Reserved    bool      `json:"reserved"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID          string             `json:"id"`
+	FromStation string             `json:"from_station"`
+	ToStation   string             `json:"to_station"`
+	RunID       string             `json:"run_id,omitempty"`
+	LeaseEpoch  int64              `json:"lease_epoch"`
+	Reserved    bool               `json:"reserved"`
+	Queue       []RouteReservation `json:"queue,omitempty"`
+	UpdatedAt   time.Time          `json:"updated_at"`
+}
+
+// QueuedRun is a single reservation in a route queue, annotated with its
+// position and whether it is still a valid candidate for the route.
+type QueuedRun struct {
+	RunID          string    `json:"run_id"`
+	Position       int       `json:"position"`
+	Valid          bool      `json:"valid"`
+	Reason         string    `json:"reason,omitempty"`
+	StationID      string    `json:"station_id"`
+	TargetPressure float64   `json:"target_pressure"`
+	QueuedAt       time.Time `json:"queued_at"`
+}
+
+// RouteQueueStatus reports the current owner and the predicted turn order of
+// the runs waiting on a route.
+type RouteQueueStatus struct {
+	Route      string      `json:"route"`
+	Reserved   bool        `json:"reserved"`
+	OwnerRunID string      `json:"owner_run_id,omitempty"`
+	Waiting    []QueuedRun `json:"waiting"`
+	NextRunID  string      `json:"next_run_id,omitempty"`
+	UpdatedAt  time.Time   `json:"updated_at"`
+}
+
+// QueueRequest is an attendant's request to line a run up for a route.
+type QueueRequest struct {
+	StationID      string  `json:"station_id"`
+	RouteID        string  `json:"route_id"`
+	TargetPressure float64 `json:"target_pressure"`
+}
+
+// QueueEnrollment reports the result of lining a run up for a route.
+type QueueEnrollment struct {
+	Status   string           `json:"status"` // "started" or "queued"
+	RunID    string           `json:"run_id"`
+	RouteID  string           `json:"route_id"`
+	Position int              `json:"position,omitempty"`
+	Record   *OperationRecord `json:"operation,omitempty"`
 }
 
 type TrackingState struct {
@@ -187,6 +227,30 @@ func (r RouteState) Validate(stations map[string]Station) error {
 	}
 	if r.Reserved && (r.RunID == "" || r.LeaseEpoch <= 0) {
 		return errors.New("reserved route has no fenced owner")
+	}
+	for _, reservation := range r.Queue {
+		if reservation.Route != "" && reservation.Route != r.ID {
+			return fmt.Errorf("route queue entry %s references route %s", reservation.RunID, reservation.Route)
+		}
+		if err := reservation.Validate(); err != nil {
+			return fmt.Errorf("route queue entry %s: %w", reservation.RunID, err)
+		}
+	}
+	return nil
+}
+
+func (q RouteReservation) Validate() error {
+	if q.RunID == "" {
+		return errors.New("queued run id is required")
+	}
+	if q.Epoch <= 0 {
+		return errors.New("queued reservation epoch must be positive")
+	}
+	if q.StationID == "" {
+		return errors.New("queued reservation station is required")
+	}
+	if q.TargetPressure <= 0 {
+		return errors.New("queued reservation pressure must be positive")
 	}
 	return nil
 }

@@ -55,6 +55,8 @@ type ReceiveRequest struct {
 type RecoveryReport struct {
 	RecoveredRuns    int  `json:"recovered_runs"`
 	RecoveredRoutes  int  `json:"recovered_routes"`
+	RecoveredQueued  int  `json:"recovered_queued"`
+	PrunedQueued     int  `json:"pruned_queued"`
 	RecoveredPermits int  `json:"recovered_permits"`
 	JournalEvents    int  `json:"journal_events"`
 	Ready            bool `json:"ready"`
@@ -193,18 +195,24 @@ func (r *Runtime) ValidateLaunchRequest(request LaunchRequest) error {
 }
 
 func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.OperationRecord, error) {
-	if err := r.ValidateLaunchRequest(request); err != nil {
-		return model.OperationRecord{}, err
-	}
-	created, err := r.CreateOperation(request.StationID)
+	enrollment, err := r.Submit(ctx, request, time.Time{}, false)
 	if err != nil {
+		if errors.Is(err, route.ErrRouteBusy) {
+			return model.OperationRecord{}, fmt.Errorf("%w; queue the run via POST /api/routes/%s/queue instead", err, request.RouteID)
+		}
 		return model.OperationRecord{}, err
 	}
-	lease, routeErr := r.Routes.Reserve(request.RouteID, created.ID, created.Epoch)
-	if routeErr != nil {
-		r.recordIncident(created.ID, "warning", routeErr.Error())
-		return model.OperationRecord{}, routeErr
+	if enrollment.Record == nil {
+		return model.OperationRecord{}, errors.New("route submission neither started nor queued")
 	}
+	return *enrollment.Record, nil
+}
+
+// startRun drives a run whose route lease has already been acquired through
+// closure, pressurization and launch fencing, then records the operation.
+// On any failure the lease is released so the caller can offer the route to
+// the next candidate.
+func (r *Runtime) startRun(created model.Run, request LaunchRequest, lease model.RouteLease, ctx context.Context) (model.OperationRecord, error) {
 	closureEpoch := created.Epoch + 1
 	r.Launcher.BeginClosure(created.ID, closureEpoch)
 	closureProof := model.CommandReceipt{
@@ -215,9 +223,9 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 		At:       time.Now().UTC(),
 	}
 	valveErr := r.Launcher.ConfirmClosure(closureProof)
-	if err := launcher.CombineLaunchResults(valveErr, routeErr); err != nil {
+	if valveErr != nil {
 		r.Routes.Release(request.RouteID, created.ID)
-		return model.OperationRecord{}, err
+		return model.OperationRecord{}, valveErr
 	}
 	if !r.Launcher.CanLaunch(closureProof) {
 		r.Routes.Release(request.RouteID, created.ID)
@@ -270,6 +278,7 @@ func (r *Runtime) Launch(ctx context.Context, request LaunchRequest) (model.Oper
 		Payload: request.RouteID,
 		At:      now,
 	}); err != nil {
+		r.Routes.Release(request.RouteID, created.ID)
 		return model.OperationRecord{}, err
 	}
 	select {
@@ -440,7 +449,7 @@ func (r *Runtime) Complete(runID, routeID string) (model.OperationRecord, error)
 	if err := run.Complete(r.Runs, runID); err != nil {
 		return model.OperationRecord{}, err
 	}
-	r.Routes.Release(routeID, runID)
+	released := r.Routes.Release(routeID, runID)
 	r.mu.Lock()
 	if routeState, ok := r.control.Routes[routeID]; ok && routeState.RunID == runID {
 		routeState.RunID = ""
@@ -458,6 +467,10 @@ func (r *Runtime) Complete(runID, routeID string) (model.OperationRecord, error)
 	}); err != nil {
 		return model.OperationRecord{}, err
 	}
+	if released {
+		// Hand the freed route to the next valid candidate before reporting.
+		r.runNext(routeID)
+	}
 	return r.Operation(runID)
 }
 
@@ -466,24 +479,46 @@ func (r *Runtime) Cancel(runID string) error {
 		return err
 	}
 	r.Pressure.Stop()
+	heldRoutes := make([]string, 0)
 	r.mu.Lock()
 	for id, routeState := range r.control.Routes {
 		if routeState.RunID == runID {
-			r.Routes.Release(id, runID)
-			routeState.RunID = ""
-			routeState.Reserved = false
-			routeState.LeaseEpoch = 0
-			routeState.UpdatedAt = time.Now().UTC()
-			r.control.Routes[id] = routeState
+			heldRoutes = append(heldRoutes, id)
 		}
 	}
 	r.control.Revision = model.NewRevision()
 	r.mu.Unlock()
-	return r.appendEvent(model.Event{
+	// Retract any waiting applications first so a cancelled run never owns a
+	// route through promotion, then release the routes it actually held.
+	queuedRoutes := r.Routes.WithdrawAll(runID)
+	for _, id := range queuedRoutes {
+		r.syncRouteQueue(id)
+	}
+	for _, id := range heldRoutes {
+		if r.Routes.Release(id, runID) {
+			r.mu.Lock()
+			if routeState, ok := r.control.Routes[id]; ok && routeState.RunID == runID {
+				routeState.RunID = ""
+				routeState.Reserved = false
+				routeState.LeaseEpoch = 0
+				routeState.UpdatedAt = time.Now().UTC()
+				r.control.Routes[id] = routeState
+			}
+			r.control.Revision = model.NewRevision()
+			r.mu.Unlock()
+		}
+	}
+	if err := r.appendEvent(model.Event{
 		RunID:   runID,
 		Kind:    "cancelled",
 		Payload: "operator cancellation",
-	})
+	}); err != nil {
+		return err
+	}
+	for _, id := range heldRoutes {
+		r.runNext(id)
+	}
+	return nil
 }
 
 func (r *Runtime) Operation(runID string) (model.OperationRecord, error) {
@@ -566,6 +601,8 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	}
 	run.Restore(r.Runs, snapshot.Control.Runs)
 	leasing := make([]model.RouteLease, 0)
+	queued := make([]model.RouteReservation, 0)
+	prunedQueued := 0
 	for _, routeState := range snapshot.Control.Routes {
 		if routeState.Reserved {
 			leasing = append(leasing, model.RouteLease{
@@ -575,8 +612,23 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 				AcquiredAt: routeState.UpdatedAt,
 			})
 		}
+		for _, reservation := range routeState.Queue {
+			if reservation.Route == "" {
+				reservation.Route = routeState.ID
+			}
+			current, ok := r.Runs.Get(reservation.RunID)
+			// Drop applications whose run vanished, ended, advanced or
+			// expired while the service was down: they must not occupy the
+			// route on recovery.
+			if !ok || current.State.Terminal() || current.Epoch != reservation.Epoch ||
+				(!reservation.ExpiresAt.IsZero() && time.Now().UTC().After(reservation.ExpiresAt)) {
+				prunedQueued++
+				continue
+			}
+			queued = append(queued, reservation)
+		}
 	}
-	route.Restore(r.Routes, leasing)
+	route.Restore(r.Routes, leasing, queued)
 	permitEvents := make([]model.Event, 0)
 	for _, permitState := range snapshot.Control.Permits {
 		if permitState.Granted {
@@ -599,7 +651,15 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	r.control.Tracking = make(map[string][]model.TrackingState)
 	r.control.Permits = make(map[string][]model.PermitState)
 	for _, value := range snapshot.Control.Routes {
+		// Rebuild the queue from the coordinator, which has pruned stale
+		// applications, rather than trusting the persisted queue verbatim.
+		value.Queue = nil
 		r.control.Routes[value.ID] = value
+	}
+	for _, reservation := range route.SnapshotQueues(r.Routes) {
+		state := r.control.Routes[reservation.Route]
+		state.Queue = append(state.Queue, reservation)
+		r.control.Routes[reservation.Route] = state
 	}
 	for _, value := range snapshot.Control.Valves {
 		r.control.Valves[value.ID] = value
@@ -626,6 +686,8 @@ func (r *Runtime) RecoverPersistent() (RecoveryReport, error) {
 	return RecoveryReport{
 		RecoveredRuns:    len(snapshot.Control.Runs),
 		RecoveredRoutes:  len(leasing),
+		RecoveredQueued:  len(queued),
+		PrunedQueued:     prunedQueued,
 		RecoveredPermits: len(permitEvents),
 		JournalEvents:    len(events),
 		Ready:            true,
@@ -638,8 +700,15 @@ func (r *Runtime) InterlockStatus() []model.Interlock {
 	for _, routeState := range snapshot.Routes {
 		ready := !routeState.Reserved || routeState.RunID != ""
 		reason := "route is available"
-		if routeState.Reserved {
+		switch {
+		case routeState.Reserved:
 			reason = fmt.Sprintf("fenced to %s at epoch %d", routeState.RunID, routeState.LeaseEpoch)
+		case len(routeState.Queue) > 0:
+			next := r.routeQueueStatus(routeState.ID).NextRunID
+			if next == "" {
+				next = "no valid candidate"
+			}
+			reason = fmt.Sprintf("route is free; %d run(s) are queued, next is %s", len(routeState.Queue), next)
 		}
 		interlocks = append(interlocks, model.Interlock{Name: "route/" + routeState.ID, Ready: ready, Reason: reason})
 	}
@@ -715,6 +784,7 @@ func (r *Runtime) HealthDetails() map[string]any {
 		"persistent_checksum": checksum,
 		"validation_error":    errorText(validationError),
 		"route_leases":        len(route.Snapshot(r.Routes)),
+		"route_queue_depth":   r.queuedRunCount(),
 		"emergency_safe":      emergency.Safe(r.Pressure),
 		"pressure_samples":    len(r.Pressure.History()),
 		"recovery_steps":      recoverySteps,
